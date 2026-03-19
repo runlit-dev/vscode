@@ -1,0 +1,65 @@
+{
+  "name": "runlit",
+  "displayName": "runlit",
+  "description": "AI code eval — catch hallucinated APIs and intent mismatches before you commit",
+  "version": "0.0.1",
+  "publisher": "runlit",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/runlit/vscode"
+  },
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": ["Other", "Linters"],
+  "keywords": ["ai", "code review", "hallucination", "eval", "cursor"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "runlit.evalSelection",
+        "title": "runlit: Eval selected code"
+      },
+      {
+        "command": "runlit.evalFile",
+        "title": "runlit: Eval current file"
+      }
+    ],
+    "configuration": {
+      "title": "runlit",
+      "properties": {
+        "runlit.apiToken": {
+          "type": "string",
+          "default": "",
+          "description": "Your runlit API token (get from runlit.dev/dashboard)"
+        },
+        "runlit.threshold": {
+          "type": "number",
+          "default": 80,
+          "description": "Eval score threshold — warn if below this value"
+        },
+        "runlit.enableInlineEval": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show eval scores inline as you write AI-generated code"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.96.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "eslint": "^9.0.0",
+    "typescript": "^5.8.0"
+  }
+}
