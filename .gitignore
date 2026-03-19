@@ -1,0 +1,27 @@
+# Node
+node_modules/
+
+# TypeScript build output
+out/
+dist/
+*.js.map
+
+# VSIX package
+*.vsix
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+*.env
+
+# Secrets
+*.pem
+*.key
+
+# Editor
+.idea/
+*.swp
