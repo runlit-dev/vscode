@@ -7,7 +7,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/runlit/vscode"
+    "url": "https://github.com/runlit-dev/vscode"
   },
   "engines": {
     "vscode": "^1.96.0"
@@ -25,6 +25,10 @@
       {
         "command": "runlit.evalFile",
         "title": "runlit: Eval current file"
+      },
+      {
+        "command": "runlit.clearDiagnostics",
+        "title": "runlit: Clear diagnostics"
       }
     ],
     "configuration": {
@@ -33,17 +37,17 @@
         "runlit.apiToken": {
           "type": "string",
           "default": "",
-          "description": "Your runlit API token (get from runlit.dev/dashboard)"
+          "markdownDescription": "Your runlit API token. Get one at [app.runlit.dev](https://app.runlit.dev) → Settings → API Keys."
+        },
+        "runlit.apiUrl": {
+          "type": "string",
+          "default": "https://api.runlit.dev",
+          "description": "runlit API base URL (override for self-hosted)"
         },
         "runlit.threshold": {
           "type": "number",
           "default": 80,
-          "description": "Eval score threshold — warn if below this value"
-        },
-        "runlit.enableInlineEval": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show eval scores inline as you write AI-generated code"
+          "description": "Warn if eval score falls below this value (0–100)"
         }
       }
     }
