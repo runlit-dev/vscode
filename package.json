@@ -1,7 +1,7 @@
 {
   "name": "runlit",
   "displayName": "runlit",
-  "description": "AI code eval — catch hallucinated APIs and intent mismatches before you commit",
+  "description": "AI code eval - catch hallucinated APIs and intent mismatches before you commit",
   "version": "0.0.1",
   "publisher": "runlit",
   "license": "MIT",
@@ -19,16 +19,28 @@
   "contributes": {
     "commands": [
       {
-        "command": "runlit.evalSelection",
-        "title": "runlit: Eval selected code"
+        "command": "runlit.evalFile",
+        "title": "runlit: Evaluate current file"
       },
       {
-        "command": "runlit.evalFile",
-        "title": "runlit: Eval current file"
+        "command": "runlit.evalSelection",
+        "title": "runlit: Evaluate selection"
       },
       {
         "command": "runlit.clearDiagnostics",
         "title": "runlit: Clear diagnostics"
+      },
+      {
+        "command": "runlit.confirmFinding",
+        "title": "runlit: Confirm finding"
+      },
+      {
+        "command": "runlit.dismissFinding",
+        "title": "runlit: Dismiss finding"
+      },
+      {
+        "command": "runlit.setApiKey",
+        "title": "runlit: Set API Key"
       }
     ],
     "configuration": {
@@ -56,14 +68,18 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src"
+    "lint": "eslint src",
+    "package": "vsce package",
+    "install-local": "npm run compile && vsce package && code --install-extension runlit-$(node -p \"require('./package.json').version\").vsix",
+    "publish": "vsce publish"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/vscode": "^1.96.0",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
-    "eslint": "^9.0.0",
+    "@vscode/vsce": "^3.0.0",
+    "eslint": "^10.1.0",
     "typescript": "^5.8.0"
   }
 }

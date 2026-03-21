@@ -61,8 +61,9 @@ interface EvalState {
 function cfg() {
   return vscode.workspace.getConfiguration("runlit");
 }
-function apiToken(): string {
-  return cfg().get<string>("apiToken", "");
+// Secrets storage takes priority over settings.json — set via "runlit: Set API Key" command.
+async function apiToken(secrets: vscode.SecretStorage): Promise<string> {
+  return (await secrets.get("runlit.apiToken")) ?? cfg().get<string>("apiToken", "");
 }
 function apiUrl(): string {
   return cfg().get<string>("apiUrl", "https://api.runlit.dev");
@@ -302,19 +303,17 @@ class RunlitCodeLensProvider implements vscode.CodeLensProvider {
 async function runEval(
   document: vscode.TextDocument,
   diff: string,
-  statusBar: vscode.StatusBarItem
+  statusBar: vscode.StatusBarItem,
+  secrets: vscode.SecretStorage
 ): Promise<void> {
-  const token = apiToken();
+  const token = await apiToken(secrets);
   if (!token) {
     const action = await vscode.window.showWarningMessage(
-      "runlit: API token not set. Go to Settings → runlit.apiToken",
-      "Open Settings"
+      "runlit: API token not set. Run \"runlit: Set API Key\" from the Command Palette.",
+      "Set API Key"
     );
-    if (action === "Open Settings") {
-      vscode.commands.executeCommand(
-        "workbench.action.openSettings",
-        "runlit.apiToken"
-      );
+    if (action === "Set API Key") {
+      vscode.commands.executeCommand("runlit.setApiKey");
     }
     return;
   }
@@ -436,7 +435,7 @@ export function activate(context: vscode.ExtensionContext) {
       const diff =
         (await gitDiffForFile(editor.document.uri)) ??
         asDiff(editor.document.getText(), filename);
-      await runEval(editor.document, diff, statusBar);
+      await runEval(editor.document, diff, statusBar, context.secrets);
     }),
 
     // runlit.evalSelection
@@ -453,7 +452,8 @@ export function activate(context: vscode.ExtensionContext) {
       await runEval(
         editor.document,
         asDiff(selected, filename),
-        statusBar
+        statusBar,
+        context.secrets
       );
     }),
 
@@ -461,7 +461,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand(
       "runlit.confirmFinding",
       async (evalId: string, findingId: string, uri: vscode.Uri) => {
-        const token = apiToken();
+        const token = await apiToken(context.secrets);
         if (!token) {
           vscode.window.showWarningMessage("runlit: API token not set");
           return;
@@ -481,7 +481,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand(
       "runlit.dismissFinding",
       async (evalId: string, findingId: string, uri: vscode.Uri) => {
-        const token = apiToken();
+        const token = await apiToken(context.secrets);
         if (!token) {
           vscode.window.showWarningMessage("runlit: API token not set");
           return;
@@ -507,6 +507,20 @@ export function activate(context: vscode.ExtensionContext) {
         }
       }
     ),
+
+    // runlit.setApiKey — prompt and store token in secrets
+    vscode.commands.registerCommand("runlit.setApiKey", async () => {
+      const token = await vscode.window.showInputBox({
+        prompt: "Paste your runlit API token",
+        password: true,
+        placeHolder: "rl_live_...",
+        ignoreFocusOut: true,
+      });
+      if (token !== undefined) {
+        await context.secrets.store("runlit.apiToken", token);
+        vscode.window.showInformationMessage("runlit: API key saved.");
+      }
+    }),
 
     // runlit.clearDiagnostics
     vscode.commands.registerCommand("runlit.clearDiagnostics", () => {
