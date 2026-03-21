@@ -325,15 +325,7 @@ async function runEval(
   try {
     const result = await postEval(
       `${apiUrl()}/v1/eval`,
-      {
-        diff,
-        config: {
-          hallucination_enabled: true,
-          intent_enabled: false,
-          security_enabled: true,
-          compliance_enabled: false,
-        },
-      },
+      { diff },
       token
     );
 
@@ -401,6 +393,107 @@ async function runEval(
   }
 }
 
+// ── Sidebar TreeView ──────────────────────────────────────────────────────────
+
+type FindingNode =
+  | { kind: "status"; label: string; icon: string }
+  | { kind: "score"; score: number; grade: string; evalId: string }
+  | { kind: "section"; label: string; count: number }
+  | { kind: "finding"; findingId: string; evalId: string; label: string; detail: string; uri: vscode.Uri; line: number; dismissed: boolean };
+
+class RunlitFindingsProvider implements vscode.TreeDataProvider<FindingNode> {
+  private _onDidChangeTreeData = new vscode.EventEmitter<void>();
+  readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+
+  refresh() { this._onDidChangeTreeData.fire(); }
+
+  getTreeItem(node: FindingNode): vscode.TreeItem {
+    if (node.kind === "status") {
+      const item = new vscode.TreeItem(node.label);
+      item.iconPath = new vscode.ThemeIcon(node.icon);
+      item.contextValue = "status";
+      return item;
+    }
+    if (node.kind === "score") {
+      const icon = node.grade === "PASS" ? "check" : node.grade === "WARN" ? "warning" : "error";
+      const item = new vscode.TreeItem(
+        `${node.grade} · ${node.score}/100`,
+        vscode.TreeItemCollapsibleState.None
+      );
+      item.iconPath = new vscode.ThemeIcon(icon);
+      item.description = `eval ${node.evalId.slice(0, 8)}`;
+      item.contextValue = "score";
+      return item;
+    }
+    if (node.kind === "section") {
+      const item = new vscode.TreeItem(
+        `${node.label} (${node.count})`,
+        node.count > 0
+          ? vscode.TreeItemCollapsibleState.Expanded
+          : vscode.TreeItemCollapsibleState.None
+      );
+      item.iconPath = new vscode.ThemeIcon(
+        node.label === "Hallucination" ? "symbol-method" : "shield"
+      );
+      return item;
+    }
+    // finding node
+    const item = new vscode.TreeItem(node.label, vscode.TreeItemCollapsibleState.None);
+    item.description = node.detail;
+    item.iconPath = new vscode.ThemeIcon(node.dismissed ? "check" : "circle-filled");
+    item.tooltip = node.dismissed ? "Dismissed" : node.label;
+    item.command = {
+      command: "vscode.open",
+      title: "Go to finding",
+      arguments: [node.uri, { selection: new vscode.Range(node.line, 0, node.line, 0) }],
+    };
+    if (!node.dismissed) {
+      item.contextValue = "finding";
+    }
+    return item;
+  }
+
+  getChildren(node?: FindingNode): FindingNode[] {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+      return [{ kind: "status", label: "Open a file to evaluate", icon: "info" }];
+    }
+
+    const state = evalStateMap.get(editor.document.uri.toString());
+    if (!state) {
+      return [{ kind: "status", label: "Run 'Evaluate current file' to start", icon: "play" }];
+    }
+
+    if (!node) {
+      // Root level: score row + two sections
+      return [
+        { kind: "section", label: "Hallucination", count: state.hallucinationFindings.length },
+        { kind: "section", label: "Security", count: state.securityFindings.length },
+      ];
+    }
+
+    if (node.kind === "section") {
+      const state = evalStateMap.get(editor.document.uri.toString());
+      if (!state) return [];
+      const findings = node.label === "Hallucination"
+        ? state.hallucinationFindings
+        : state.securityFindings;
+      return findings.map(f => ({
+        kind: "finding" as const,
+        findingId: f.findingId,
+        evalId: state.evalId,
+        label: f.label,
+        detail: `line ${f.line + 1}`,
+        uri: editor.document.uri,
+        line: f.line,
+        dismissed: dismissedFindings.has(f.findingId),
+      }));
+    }
+
+    return [];
+  }
+}
+
 // ── Extension lifecycle ───────────────────────────────────────────────────────
 
 export function activate(context: vscode.ExtensionContext) {
@@ -423,7 +516,18 @@ export function activate(context: vscode.ExtensionContext) {
     codeLensProvider
   );
 
-  context.subscriptions.push(statusBar, diagnosticCollection, codeLensDisposable);
+  // Register sidebar findings panel
+  const findingsProvider = new RunlitFindingsProvider();
+  const findingsTree = vscode.window.createTreeView("runlit.findings", {
+    treeDataProvider: findingsProvider,
+    showCollapseAll: false,
+  });
+  // Refresh sidebar whenever CodeLens refreshes (after eval or dismiss)
+  codeLensEventEmitter.event(() => findingsProvider.refresh());
+  // Also refresh when the active editor changes
+  vscode.window.onDidChangeActiveTextEditor(() => findingsProvider.refresh(), null, context.subscriptions);
+
+  context.subscriptions.push(statusBar, diagnosticCollection, codeLensDisposable, findingsTree);
 
   // runlit.evalFile
   context.subscriptions.push(

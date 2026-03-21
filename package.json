@@ -16,7 +16,25 @@
   "keywords": ["ai", "code review", "hallucination", "eval", "cursor"],
   "activationEvents": ["onStartupFinished"],
   "main": "./out/extension.js",
+  "icon": "images/icon.png",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "runlit",
+          "title": "runlit",
+          "icon": "images/icon.png"
+        }
+      ]
+    },
+    "views": {
+      "runlit": [
+        {
+          "id": "runlit.findings",
+          "name": "Findings"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "runlit.evalFile",
