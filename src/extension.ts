@@ -49,6 +49,13 @@ interface EvalResult {
   latency_ms: number;
 }
 
+// Stored per URI after an eval completes — used by the CodeLens provider.
+interface EvalState {
+  evalId: string;
+  hallucinationFindings: Array<{ findingId: string; line: number; label: string }>;
+  securityFindings: Array<{ findingId: string; line: number; label: string }>;
+}
+
 // ── Config helpers ─────────────────────────────────────────────────────────────
 
 function cfg() {
@@ -64,7 +71,7 @@ function threshold(): number {
   return cfg().get<number>("threshold", 80);
 }
 
-// ── HTTP helper ───────────────────────────────────────────────────────────────
+// ── HTTP helpers ───────────────────────────────────────────────────────────────
 
 function postEval(
   endpoint: string,
@@ -102,6 +109,43 @@ function postEval(
       });
     });
     req.on("error", reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
+/** POST /v1/evals/{evalId}/feedback — returns true on success. */
+async function postFeedback(
+  evalId: string,
+  feedbackType: "thumbs_up" | "finding_dismissed",
+  findingId: string,
+  token: string
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const base = apiUrl().replace(/\/$/, "");
+    const parsed = url.parse(`${base}/v1/evals/${evalId}/feedback`);
+    const payload = JSON.stringify({
+      finding_id: findingId,
+      feedback_type: feedbackType,
+      source: "vscode",
+    });
+    const options: http.RequestOptions = {
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+      path: parsed.path,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload),
+        Authorization: `Bearer ${token}`,
+      },
+    };
+    const lib = parsed.protocol === "https:" ? https : http;
+    const req = lib.request(options, (res) => {
+      res.resume(); // drain
+      resolve(res.statusCode === 201 || res.statusCode === 200);
+    });
+    req.on("error", () => resolve(false));
     req.write(payload);
     req.end();
   });
@@ -203,6 +247,56 @@ function gradeIcon(grade: string, score: number): string {
   return `$(error) runlit ${score}`;
 }
 
+// ── CodeLens provider ─────────────────────────────────────────────────────────
+
+/** Per-document eval state keyed by URI string. Cleared on new eval. */
+const evalStateMap = new Map<string, EvalState>();
+
+/** Set of dismissed finding IDs — persisted to workspaceState between restarts. */
+let dismissedFindings: Set<string>;
+const DISMISSED_KEY = "runlit.dismissedFindings";
+
+const codeLensEventEmitter = new vscode.EventEmitter<void>();
+
+class RunlitCodeLensProvider implements vscode.CodeLensProvider {
+  onDidChangeCodeLenses = codeLensEventEmitter.event;
+
+  provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
+    const state = evalStateMap.get(document.uri.toString());
+    if (!state) return [];
+
+    const lenses: vscode.CodeLens[] = [];
+    const all = [...state.hallucinationFindings, ...state.securityFindings];
+
+    for (const finding of all) {
+      if (dismissedFindings.has(finding.findingId)) continue;
+
+      const lineIdx = Math.min(
+        Math.max(0, finding.line - 1),
+        document.lineCount - 1
+      );
+      const range = document.lineAt(lineIdx).range;
+
+      lenses.push(
+        new vscode.CodeLens(range, {
+          title: "$(check) Confirm",
+          tooltip: "Mark this finding as correct — sends thumbs_up feedback",
+          command: "runlit.confirmFinding",
+          arguments: [state.evalId, finding.findingId, document.uri],
+        }),
+        new vscode.CodeLens(range, {
+          title: "$(x) Dismiss",
+          tooltip: "Dismiss this finding — sends finding_dismissed feedback",
+          command: "runlit.dismissFinding",
+          arguments: [state.evalId, finding.findingId, document.uri],
+        })
+      );
+    }
+
+    return lenses;
+  }
+}
+
 // ── Core eval ─────────────────────────────────────────────────────────────────
 
 async function runEval(
@@ -259,6 +353,25 @@ async function runEval(
         ? new vscode.ThemeColor("statusBarItem.warningBackground")
         : undefined;
 
+    // Build CodeLens state for this document
+    const state: EvalState = {
+      evalId: result.eval_id,
+      hallucinationFindings: (result.hallucination?.findings ?? []).map(
+        (f, i) => ({
+          findingId: `hal-${result.eval_id}-${i}`,
+          line: f.line || 1,
+          label: `${f.api_ref}: ${f.reason}`,
+        })
+      ),
+      securityFindings: (result.security?.findings ?? []).map((f, i) => ({
+        findingId: `sec-${result.eval_id}-${i}`,
+        line: f.line || 1,
+        label: f.message,
+      })),
+    };
+    evalStateMap.set(document.uri.toString(), state);
+    codeLensEventEmitter.fire();
+
     diagnosticCollection.set(document.uri, toDiagnostics(result, document));
 
     const hCount = result.hallucination?.findings?.length ?? 0;
@@ -292,15 +405,41 @@ async function runEval(
 // ── Extension lifecycle ───────────────────────────────────────────────────────
 
 export function activate(context: vscode.ExtensionContext) {
+  // Load persisted dismissed findings from workspace state
+  dismissedFindings = new Set(
+    context.workspaceState.get<string[]>(DISMISSED_KEY, [])
+  );
+
   const statusBar = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Left,
     100
   );
   statusBar.command = "runlit.evalFile";
   statusBar.tooltip = "runlit — click to eval current file";
-  context.subscriptions.push(statusBar, diagnosticCollection);
 
+  // Register CodeLens provider for all languages
+  const codeLensProvider = new RunlitCodeLensProvider();
+  const codeLensDisposable = vscode.languages.registerCodeLensProvider(
+    { scheme: "file" },
+    codeLensProvider
+  );
+
+  context.subscriptions.push(statusBar, diagnosticCollection, codeLensDisposable);
+
+  // runlit.evalFile
   context.subscriptions.push(
+    vscode.commands.registerCommand("runlit.evalFile", async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) return;
+      const filename =
+        editor.document.fileName.split(/[\\/]/).pop() ?? "file";
+      const diff =
+        (await gitDiffForFile(editor.document.uri)) ??
+        asDiff(editor.document.getText(), filename);
+      await runEval(editor.document, diff, statusBar);
+    }),
+
+    // runlit.evalSelection
     vscode.commands.registerCommand("runlit.evalSelection", async () => {
       const editor = vscode.window.activeTextEditor;
       if (!editor) return;
@@ -318,19 +457,62 @@ export function activate(context: vscode.ExtensionContext) {
       );
     }),
 
-    vscode.commands.registerCommand("runlit.evalFile", async () => {
-      const editor = vscode.window.activeTextEditor;
-      if (!editor) return;
-      const filename =
-        editor.document.fileName.split(/[\\/]/).pop() ?? "file";
-      const diff =
-        (await gitDiffForFile(editor.document.uri)) ??
-        asDiff(editor.document.getText(), filename);
-      await runEval(editor.document, diff, statusBar);
-    }),
+    // runlit.confirmFinding — thumbs_up feedback
+    vscode.commands.registerCommand(
+      "runlit.confirmFinding",
+      async (evalId: string, findingId: string, uri: vscode.Uri) => {
+        const token = apiToken();
+        if (!token) {
+          vscode.window.showWarningMessage("runlit: API token not set");
+          return;
+        }
+        const ok = await postFeedback(evalId, "thumbs_up", findingId, token);
+        if (ok) {
+          vscode.window.showInformationMessage(
+            "runlit: finding confirmed ✓ — thank you for the feedback"
+          );
+        } else {
+          vscode.window.showWarningMessage("runlit: failed to send feedback");
+        }
+      }
+    ),
 
+    // runlit.dismissFinding — finding_dismissed feedback + suppress for session
+    vscode.commands.registerCommand(
+      "runlit.dismissFinding",
+      async (evalId: string, findingId: string, uri: vscode.Uri) => {
+        const token = apiToken();
+        if (!token) {
+          vscode.window.showWarningMessage("runlit: API token not set");
+          return;
+        }
+        // Suppress immediately (optimistic)
+        dismissedFindings.add(findingId);
+        await context.workspaceState.update(
+          DISMISSED_KEY,
+          Array.from(dismissedFindings)
+        );
+        codeLensEventEmitter.fire();
+
+        const ok = await postFeedback(evalId, "finding_dismissed", findingId, token);
+        if (!ok) {
+          // Revert on failure
+          dismissedFindings.delete(findingId);
+          await context.workspaceState.update(
+            DISMISSED_KEY,
+            Array.from(dismissedFindings)
+          );
+          codeLensEventEmitter.fire();
+          vscode.window.showWarningMessage("runlit: failed to send feedback");
+        }
+      }
+    ),
+
+    // runlit.clearDiagnostics
     vscode.commands.registerCommand("runlit.clearDiagnostics", () => {
       diagnosticCollection.clear();
+      evalStateMap.clear();
+      codeLensEventEmitter.fire();
       statusBar.text = "$(circle-outline) runlit";
       statusBar.backgroundColor = undefined;
     }),
@@ -341,6 +523,8 @@ export function activate(context: vscode.ExtensionContext) {
 
     vscode.workspace.onDidCloseTextDocument((doc) => {
       diagnosticCollection.delete(doc.uri);
+      evalStateMap.delete(doc.uri.toString());
+      codeLensEventEmitter.fire();
     })
   );
 
@@ -349,4 +533,5 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {
   diagnosticCollection.dispose();
+  codeLensEventEmitter.dispose();
 }
