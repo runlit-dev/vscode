@@ -3,7 +3,26 @@ import * as https from "https";
 import * as http from "http";
 import * as url from "url";
 
-// ── Types ─────────────────────────────────────────────────────────────────────
+// ── Types — POST /v1/eval (lightweight scores) ───────────────────────────────
+
+interface PostSignalResult {
+  score: number;
+  model?: string;
+  latency_ms?: number;
+}
+
+interface PostEvalResult {
+  eval_id: string;
+  score: number;
+  grade: "PASS" | "WARN" | "BLOCK";
+  hallucination: PostSignalResult;
+  intent: PostSignalResult;
+  security: PostSignalResult;
+  compliance: PostSignalResult;
+  latency_ms: number;
+}
+
+// ── Types — GET /v1/evals/{id} (detailed findings) ───────────────────────────
 
 interface HallucinatedAPI {
   api_ref: string;
@@ -22,31 +41,72 @@ interface SecurityFinding {
   message: string;
   severity: string;
   cwe: string;
+  snippet: string;
+  source: string;
 }
 
-interface EvalResult {
-  eval_id: string;
-  score: number;
-  grade: "PASS" | "WARN" | "BLOCK";
-  hallucination: {
+interface ComplianceFinding {
+  rule_id: string;
+  pack: string;
+  file: string;
+  line: number;
+  message: string;
+  control: string;
+  severity: string;
+  remediation: string;
+}
+
+interface EvalDetailFindings {
+  hallucination?: {
     score: number;
     findings: HallucinatedAPI[];
     model: string;
     latency_ms: number;
+    input_tokens: number;
+    output_tokens: number;
+    reasoning: string;
   };
-  security: {
+  intent?: {
+    score: number;
+    code_summary: string;
+    stated_intent: string;
+    mismatches: string[];
+    model: string;
+    latency_ms: number;
+    input_tokens: number;
+    output_tokens: number;
+    reasoning: string;
+  };
+  security?: {
     score: number;
     findings: SecurityFinding[];
     model: string;
     latency_ms: number;
+    input_tokens: number;
+    output_tokens: number;
+    reasoning: string;
   };
-  intent: {
+  compliance?: {
     score: number;
-    code_summary: string;
-    mismatches: string[];
-    model: string;
+    findings: ComplianceFinding[];
+    packs_evaluated: string[];
+    latency_ms: number;
+    input_tokens: number;
+    output_tokens: number;
+    reasoning: string;
   };
+}
+
+interface EvalDetail {
+  id: string;
+  score: number;
+  grade: string;
+  hallucination_score: number;
+  intent_score: number;
+  security_score: number;
+  compliance_score: number;
   latency_ms: number;
+  findings?: EvalDetailFindings;
 }
 
 // Stored per URI after an eval completes — used by the CodeLens provider.
@@ -54,6 +114,7 @@ interface EvalState {
   evalId: string;
   hallucinationFindings: Array<{ findingId: string; line: number; label: string }>;
   securityFindings: Array<{ findingId: string; line: number; label: string }>;
+  complianceFindings: Array<{ findingId: string; line: number; label: string }>;
 }
 
 // ── Config helpers ─────────────────────────────────────────────────────────────
@@ -74,24 +135,28 @@ function threshold(): number {
 
 // ── HTTP helpers ───────────────────────────────────────────────────────────────
 
-function postEval(
+function httpRequest<T>(
   endpoint: string,
-  body: unknown,
-  token: string
-): Promise<EvalResult> {
+  method: string,
+  token: string,
+  body?: unknown
+): Promise<T> {
   return new Promise((resolve, reject) => {
     const parsed = url.parse(endpoint);
-    const payload = JSON.stringify(body);
+    const payload = body ? JSON.stringify(body) : undefined;
+    const headers: Record<string, string | number> = {
+      Authorization: `Bearer ${token}`,
+    };
+    if (payload) {
+      headers["Content-Type"] = "application/json";
+      headers["Content-Length"] = Buffer.byteLength(payload);
+    }
     const options: http.RequestOptions = {
       hostname: parsed.hostname,
       port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
       path: parsed.path,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(payload),
-        Authorization: `Bearer ${token}`,
-      },
+      method,
+      headers,
     };
     const lib = parsed.protocol === "https:" ? https : http;
     const req = lib.request(options, (res) => {
@@ -110,9 +175,36 @@ function postEval(
       });
     });
     req.on("error", reject);
-    req.write(payload);
+    if (payload) req.write(payload);
     req.end();
   });
+}
+
+function postEval(
+  endpoint: string,
+  body: unknown,
+  token: string
+): Promise<PostEvalResult> {
+  return httpRequest<PostEvalResult>(endpoint, "POST", token, body);
+}
+
+/** GET /v1/evals/{evalId} — fetch detailed findings after eval completes. */
+async function getEvalDetail(
+  evalId: string,
+  token: string
+): Promise<EvalDetail | null> {
+  const base = apiUrl().replace(/\/$/, "");
+  // The eval is persisted async — wait briefly for the DB write to complete.
+  await new Promise((r) => setTimeout(r, 800));
+  try {
+    return await httpRequest<EvalDetail>(
+      `${base}/v1/evals/${encodeURIComponent(evalId)}`,
+      "GET",
+      token
+    );
+  } catch {
+    return null;
+  }
 }
 
 /** POST /v1/evals/{evalId}/feedback — returns true on success. */
@@ -191,12 +283,12 @@ const diagnosticCollection =
   vscode.languages.createDiagnosticCollection("runlit");
 
 function toDiagnostics(
-  result: EvalResult,
+  findings: EvalDetailFindings | undefined,
   document: vscode.TextDocument
 ): vscode.Diagnostic[] {
   const diags: vscode.Diagnostic[] = [];
 
-  for (const f of result.hallucination?.findings ?? []) {
+  for (const f of findings?.hallucination?.findings ?? []) {
     const lineIdx = Math.min(
       Math.max(0, (f.line || 1) - 1),
       document.lineCount - 1
@@ -218,22 +310,64 @@ function toDiagnostics(
     diags.push(diag);
   }
 
-  for (const f of result.security?.findings ?? []) {
+  for (const f of findings?.security?.findings ?? []) {
     const lineIdx = Math.min(
       Math.max(0, (f.line || 1) - 1),
       document.lineCount - 1
     );
-    const sev = ["critical", "high"].includes(f.severity)
+    const sev = ["critical", "high"].includes((f.severity || "").toLowerCase())
       ? vscode.DiagnosticSeverity.Error
       : vscode.DiagnosticSeverity.Warning;
     const diag = new vscode.Diagnostic(
       document.lineAt(lineIdx).range,
-      `Security [${f.severity?.toUpperCase()}]: ${f.message}${
+      `Security [${(f.severity || "MEDIUM").toUpperCase()}]: ${f.message}${
         f.cwe ? ` (${f.cwe})` : ""
       }`,
       sev
     );
-    diag.source = "runlit-security";
+    diag.source = `runlit-security (${f.source || "llm"})`;
+    diag.code = {
+      value: f.rule_id || "security",
+      target: vscode.Uri.parse("https://docs.runlit.dev/signals/security"),
+    };
+    diags.push(diag);
+  }
+
+  for (const f of findings?.compliance?.findings ?? []) {
+    const lineIdx = Math.min(
+      Math.max(0, (f.line || 1) - 1),
+      document.lineCount - 1
+    );
+    const sev = ["critical", "high"].includes((f.severity || "").toLowerCase())
+      ? vscode.DiagnosticSeverity.Error
+      : vscode.DiagnosticSeverity.Warning;
+    const diag = new vscode.Diagnostic(
+      document.lineAt(lineIdx).range,
+      `Compliance [${f.pack}] ${f.control}: ${f.message}${
+        f.remediation ? ` — fix: ${f.remediation}` : ""
+      }`,
+      sev
+    );
+    diag.source = "runlit-compliance";
+    diag.code = {
+      value: f.rule_id || "compliance",
+      target: vscode.Uri.parse("https://docs.runlit.dev/signals/compliance"),
+    };
+    diags.push(diag);
+  }
+
+  // Intent mismatches are file-level (no specific line)
+  for (const m of findings?.intent?.mismatches ?? []) {
+    const diag = new vscode.Diagnostic(
+      document.lineAt(0).range,
+      `Intent mismatch: ${m}`,
+      vscode.DiagnosticSeverity.Warning
+    );
+    diag.source = "runlit-intent";
+    diag.code = {
+      value: "intent-mismatch",
+      target: vscode.Uri.parse("https://docs.runlit.dev/signals/intent"),
+    };
     diags.push(diag);
   }
 
@@ -267,7 +401,7 @@ class RunlitCodeLensProvider implements vscode.CodeLensProvider {
     if (!state) return [];
 
     const lenses: vscode.CodeLens[] = [];
-    const all = [...state.hallucinationFindings, ...state.securityFindings];
+    const all = [...state.hallucinationFindings, ...state.securityFindings, ...state.complianceFindings];
 
     for (const finding of all) {
       if (dismissedFindings.has(finding.findingId)) continue;
@@ -323,6 +457,7 @@ async function runEval(
   statusBar.show();
 
   try {
+    // Phase 1: POST /v1/eval — get scores immediately
     const result = await postEval(
       `${apiUrl()}/v1/eval`,
       { diff },
@@ -333,9 +468,13 @@ async function runEval(
     statusBar.tooltip = [
       `runlit — ${result.score}/100 (${result.grade})`,
       `Hallucination: ${Math.round((result.hallucination?.score ?? 1) * 100)}`,
+      `Intent: ${Math.round((result.intent?.score ?? 1) * 100)}`,
       `Security: ${Math.round((result.security?.score ?? 1) * 100)}`,
+      `Compliance: ${Math.round((result.compliance?.score ?? 1) * 100)}`,
       `Latency: ${result.latency_ms}ms`,
       `Eval ID: ${result.eval_id}`,
+      ``,
+      `View in dashboard →`,
     ].join("\n");
     statusBar.backgroundColor =
       result.grade === "BLOCK"
@@ -344,42 +483,74 @@ async function runEval(
         ? new vscode.ThemeColor("statusBarItem.warningBackground")
         : undefined;
 
+    // Phase 2: GET /v1/evals/{id} — fetch detailed findings for diagnostics
+    const detail = await getEvalDetail(result.eval_id, token);
+    const findings = detail?.findings;
+
     // Build CodeLens state for this document
     const state: EvalState = {
       evalId: result.eval_id,
-      hallucinationFindings: (result.hallucination?.findings ?? []).map(
+      hallucinationFindings: (findings?.hallucination?.findings ?? []).map(
         (f, i) => ({
           findingId: `hal-${result.eval_id}-${i}`,
           line: f.line || 1,
           label: `${f.api_ref}: ${f.reason}`,
         })
       ),
-      securityFindings: (result.security?.findings ?? []).map((f, i) => ({
+      securityFindings: (findings?.security?.findings ?? []).map((f, i) => ({
         findingId: `sec-${result.eval_id}-${i}`,
         line: f.line || 1,
         label: f.message,
       })),
+      complianceFindings: (findings?.compliance?.findings ?? []).map(
+        (f, i) => ({
+          findingId: `cmp-${result.eval_id}-${i}`,
+          line: f.line || 1,
+          label: `[${f.pack}] ${f.control}: ${f.message}`,
+        })
+      ),
     };
     evalStateMap.set(document.uri.toString(), state);
     codeLensEventEmitter.fire();
 
-    diagnosticCollection.set(document.uri, toDiagnostics(result, document));
+    diagnosticCollection.set(document.uri, toDiagnostics(findings, document));
 
-    const hCount = result.hallucination?.findings?.length ?? 0;
-    const sCount = result.security?.findings?.length ?? 0;
+    const hCount = findings?.hallucination?.findings?.length ?? 0;
+    const sCount = findings?.security?.findings?.length ?? 0;
+    const cCount = findings?.compliance?.findings?.length ?? 0;
+    const iCount = findings?.intent?.mismatches?.length ?? 0;
+    const totalFindings = hCount + sCount + cCount + iCount;
 
     if (result.grade === "BLOCK") {
-      vscode.window.showErrorMessage(
-        `runlit BLOCK — ${result.score}/100. ${hCount} hallucinated API(s), ${sCount} security issue(s).`
+      const parts = [];
+      if (hCount > 0) parts.push(`${hCount} hallucinated API(s)`);
+      if (sCount > 0) parts.push(`${sCount} security issue(s)`);
+      if (cCount > 0) parts.push(`${cCount} compliance violation(s)`);
+      if (iCount > 0) parts.push(`${iCount} intent mismatch(es)`);
+      const action = await vscode.window.showErrorMessage(
+        `runlit BLOCK — ${result.score}/100. ${parts.join(", ") || "Score below threshold"}.`,
+        "View in Dashboard"
       );
+      if (action === "View in Dashboard") {
+        vscode.env.openExternal(
+          vscode.Uri.parse(`https://app.runlit.dev/evals/${result.eval_id}`)
+        );
+      }
     } else if (result.grade === "WARN" || result.score < threshold()) {
-      const detail =
-        hCount + sCount > 0
-          ? `${hCount} hallucinated API(s), ${sCount} security issue(s).`
-          : "";
-      vscode.window.showWarningMessage(
-        `runlit WARN — ${result.score}/100. ${detail}`
+      const parts = [];
+      if (hCount > 0) parts.push(`${hCount} hallucinated API(s)`);
+      if (sCount > 0) parts.push(`${sCount} security issue(s)`);
+      if (cCount > 0) parts.push(`${cCount} compliance violation(s)`);
+      if (iCount > 0) parts.push(`${iCount} intent mismatch(es)`);
+      const action = await vscode.window.showWarningMessage(
+        `runlit WARN — ${result.score}/100. ${parts.join(", ") || "Score below threshold"}.`,
+        "View in Dashboard"
       );
+      if (action === "View in Dashboard") {
+        vscode.env.openExternal(
+          vscode.Uri.parse(`https://app.runlit.dev/evals/${result.eval_id}`)
+        );
+      }
     } else {
       vscode.window.showInformationMessage(
         `runlit PASS — ${result.score}/100 ✓`
@@ -432,9 +603,13 @@ class RunlitFindingsProvider implements vscode.TreeDataProvider<FindingNode> {
           ? vscode.TreeItemCollapsibleState.Expanded
           : vscode.TreeItemCollapsibleState.None
       );
-      item.iconPath = new vscode.ThemeIcon(
-        node.label === "Hallucination" ? "symbol-method" : "shield"
-      );
+      const iconMap: Record<string, string> = {
+        Hallucination: "symbol-method",
+        Security: "shield",
+        Compliance: "law",
+        Intent: "git-compare",
+      };
+      item.iconPath = new vscode.ThemeIcon(iconMap[node.label] ?? "info");
       return item;
     }
     // finding node
@@ -465,25 +640,36 @@ class RunlitFindingsProvider implements vscode.TreeDataProvider<FindingNode> {
     }
 
     if (!node) {
-      // Root level: score row + two sections
       return [
         { kind: "section", label: "Hallucination", count: state.hallucinationFindings.length },
         { kind: "section", label: "Security", count: state.securityFindings.length },
+        { kind: "section", label: "Compliance", count: state.complianceFindings.length },
       ];
     }
 
     if (node.kind === "section") {
       const state = evalStateMap.get(editor.document.uri.toString());
       if (!state) return [];
-      const findings = node.label === "Hallucination"
-        ? state.hallucinationFindings
-        : state.securityFindings;
+      let findings: Array<{ findingId: string; line: number; label: string }>;
+      switch (node.label) {
+        case "Hallucination":
+          findings = state.hallucinationFindings;
+          break;
+        case "Security":
+          findings = state.securityFindings;
+          break;
+        case "Compliance":
+          findings = state.complianceFindings;
+          break;
+        default:
+          findings = [];
+      }
       return findings.map(f => ({
         kind: "finding" as const,
         findingId: f.findingId,
         evalId: state.evalId,
         label: f.label,
-        detail: `line ${f.line + 1}`,
+        detail: `line ${f.line}`,
         uri: editor.document.uri,
         line: f.line,
         dismissed: dismissedFindings.has(f.findingId),
@@ -633,6 +819,20 @@ export function activate(context: vscode.ExtensionContext) {
       codeLensEventEmitter.fire();
       statusBar.text = "$(circle-outline) runlit";
       statusBar.backgroundColor = undefined;
+    }),
+
+    // runlit.openInDashboard — open the latest eval in the dashboard
+    vscode.commands.registerCommand("runlit.openInDashboard", () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) return;
+      const state = evalStateMap.get(editor.document.uri.toString());
+      if (!state) {
+        vscode.window.showWarningMessage("runlit: no eval result — run an eval first");
+        return;
+      }
+      vscode.env.openExternal(
+        vscode.Uri.parse(`https://app.runlit.dev/evals/${state.evalId}`)
+      );
     }),
 
     vscode.window.onDidChangeActiveTextEditor((editor) => {
