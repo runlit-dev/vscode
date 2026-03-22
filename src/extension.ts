@@ -244,6 +244,69 @@ async function postFeedback(
   });
 }
 
+// ── Git helpers ───────────────────────────────────────────────────────────────
+
+function getGitAPI(): { repositories: any[] } | null {
+  const gitExt = vscode.extensions.getExtension("vscode.git");
+  if (!gitExt) return null;
+  const git = gitExt.exports.getAPI(1);
+  if (!git || git.repositories.length === 0) return null;
+  return git;
+}
+
+/** Extract "owner/repo" from the first git remote URL. */
+function getRepoSlug(): string | undefined {
+  try {
+    const git = getGitAPI();
+    if (!git) return undefined;
+    const remotes = git.repositories[0]?.state?.remotes;
+    if (!remotes || remotes.length === 0) return undefined;
+    const remote = remotes.find((r: any) => r.name === "origin") ?? remotes[0];
+    const fetchUrl: string | undefined = remote.fetchUrl ?? remote.pushUrl;
+    if (!fetchUrl) return undefined;
+    // Match SSH (git@github.com:owner/repo.git) or HTTPS (https://github.com/owner/repo.git)
+    const match = fetchUrl.match(/[/:]([^/:]+\/[^/.]+?)(?:\.git)?$/);
+    return match?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
+// ── .runlit.yml reader ────────────────────────────────────────────────────────
+
+async function readRunlitYml(): Promise<Record<string, unknown> | undefined> {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) return undefined;
+  const ymlUri = vscode.Uri.joinPath(folders[0].uri, ".runlit.yml");
+  try {
+    const bytes = await vscode.workspace.fs.readFile(ymlUri);
+    const text = Buffer.from(bytes).toString("utf-8");
+    // Minimal YAML key: value parser — enough for flat config like
+    //   compliance_packs: [pci-dss, soc2]
+    //   block_on_compliance: true
+    const obj: Record<string, unknown> = {};
+    for (const line of text.split("\n")) {
+      const m = line.match(/^\s*([a-z_]+)\s*:\s*(.+)/);
+      if (!m) continue;
+      const val = m[2].trim();
+      if (val.startsWith("[") && val.endsWith("]")) {
+        obj[m[1]] = val.slice(1, -1).split(",").map(s => s.trim().replace(/^["']|["']$/g, ""));
+      } else if (val === "true") {
+        obj[m[1]] = true;
+      } else if (val === "false") {
+        obj[m[1]] = false;
+      } else if (/^\d+$/.test(val)) {
+        obj[m[1]] = parseInt(val, 10);
+      } else {
+        obj[m[1]] = val.replace(/^["']|["']$/g, "");
+      }
+    }
+    return Object.keys(obj).length > 0 ? obj : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // ── Diff builder ──────────────────────────────────────────────────────────────
 
 function asDiff(content: string, filename: string): string {
@@ -258,10 +321,8 @@ function asDiff(content: string, filename: string): string {
 
 async function gitDiffForFile(uri: vscode.Uri): Promise<string | null> {
   try {
-    const gitExt = vscode.extensions.getExtension("vscode.git");
-    if (!gitExt) return null;
-    const git = gitExt.exports.getAPI(1);
-    if (!git || git.repositories.length === 0) return null;
+    const git = getGitAPI();
+    if (!git) return null;
     const repo = git.repositories[0];
     const changes = [
       ...(repo.state.workingTreeChanges || []),
@@ -457,10 +518,18 @@ async function runEval(
   statusBar.show();
 
   try {
+    // Gather optional context for richer eval
+    const repo = getRepoSlug();
+    const runlitConfig = await readRunlitYml();
+
     // Phase 1: POST /v1/eval — get scores immediately
+    const evalBody: Record<string, unknown> = { diff };
+    if (repo) evalBody.repo = repo;
+    if (runlitConfig) evalBody.config = runlitConfig;
+
     const result = await postEval(
       `${apiUrl()}/v1/eval`,
-      { diff },
+      evalBody,
       token
     );
 
